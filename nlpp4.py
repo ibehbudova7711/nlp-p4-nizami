@@ -1,23 +1,23 @@
-#!/usr/bin/env python3
+
 """
 BiDAF-style QA model for SQuAD with either:
 1) contextualized BERT embeddings, or
-2) static GloVe embeddings.
-Example usage:
-    python nlpp4.py --embedding_type bert --train_samples 2000 --val_samples 500 --epochs 2
-    python nlpp4.py --embedding_type glove --glove_path glove.6B.100d.txt --train_samples 2000 --val_samples 500 --epochs 2
+2) static GloVe embeddings loaded from one or more embedding files.
 
-To compare both:
-    python nlpp4.py --embedding_type glove --glove_path glove.6B.100d.txt --run_name glove_baseline
-    python nlpp4.py --embedding_type bert --run_name bert_bidaf
+Examples:
+    python nlpp4.py --embedding_type bert --train_samples 2000 --val_samples 500 --epochs 2
+
+    python nlpp4.py \
+        --embedding_type glove \
+        --glove_paths glove.6B.100d.txt other_glove_100d.txt \
+        --glove_dim 100 \
+        --train_samples 2000 --val_samples 500 --epochs 2
 """
 
 from __future__ import annotations
-
 import argparse
 import collections
 import json
-import math
 import os
 import random
 import re
@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Any
 
 import numpy as np
+import requests
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
@@ -33,7 +34,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from datasets import load_dataset
 import evaluate
-from transformers import BertModel, BertTokenizerFast
+from transformers import BertModel, AutoTokenizer
 
 
 # -----------------------------
@@ -77,23 +78,45 @@ def build_vocab(samples: List[Dict[str, Any]], min_freq: int = 1) -> Dict[str, i
     return vocab
 
 
-def load_glove(glove_path: str, word2idx: Dict[str, int], emb_dim: int) -> np.ndarray:
+def load_glove_from_multiple(glove_paths: List[str], word2idx: Dict[str, int], emb_dim: int) -> np.ndarray:
+    """
+    Load vectors from multiple GloVe-like text files.
+    Earlier files get priority. Later files only fill words that are still missing.
+    All files must use the same embedding dimension.
+    """
     embeddings = np.random.normal(scale=0.02, size=(len(word2idx), emb_dim)).astype(np.float32)
     embeddings[word2idx["<pad>"]] = 0.0
 
-    found = 0
-    with open(glove_path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip().split(" ")
-            word = parts[0]
-            if word in word2idx:
+    found_words = set()
+    total_loaded = 0
+
+    for glove_path in glove_paths:
+        if not os.path.exists(glove_path):
+            raise FileNotFoundError(f"GloVe file not found: {glove_path}")
+
+        file_loaded = 0
+        with open(glove_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip().split(" ")
+                if len(parts) < emb_dim + 1:
+                    continue
+
+                word = parts[0]
+                if word not in word2idx or word in found_words:
+                    continue
+
                 vector = np.asarray(parts[1:], dtype=np.float32)
                 if vector.shape[0] != emb_dim:
                     continue
-                embeddings[word2idx[word]] = vector
-                found += 1
 
-    print(f"Loaded GloVe vectors for {found}/{len(word2idx)} vocab items")
+                embeddings[word2idx[word]] = vector
+                found_words.add(word)
+                file_loaded += 1
+                total_loaded += 1
+
+        print(f"Loaded {file_loaded} vocab items from {glove_path}")
+
+    print(f"Loaded GloVe vectors for {total_loaded}/{len(word2idx)} vocab items from {len(glove_paths)} file(s)")
     return embeddings
 
 
@@ -122,7 +145,7 @@ class SquadBertDataset(Dataset):
         max_question_len: int = 64,
     ):
         self.data = hf_split
-        self.tokenizer = BertTokenizerFast.from_pretrained(tokenizer_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
         self.max_context_len = max_context_len
         self.max_question_len = max_question_len
         self.features = [self._build_feature(ex) for ex in self.data]
@@ -211,8 +234,6 @@ class SquadStaticDataset(Dataset):
         example_id = ex["id"]
 
         context_words = context.split()[: self.max_context_len]
-        question_words = question.split()[: self.max_question_len]
-
         context_ids = self._encode_words(context, self.max_context_len)
         question_ids = self._encode_words(question, self.max_question_len)
 
@@ -305,42 +326,22 @@ class BiDAFAttention(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-    def forward(
-        self,
-        context: torch.Tensor,
-        question: torch.Tensor,
-        question_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        # context: [B, C, H]
-        # question: [B, Q, H]
-        similarity = torch.bmm(context, question.transpose(1, 2))  # [B, C, Q]
-
+    def forward(self, context: torch.Tensor, question: torch.Tensor, question_mask: torch.Tensor) -> torch.Tensor:
+        similarity = torch.bmm(context, question.transpose(1, 2))
         q_mask = question_mask.unsqueeze(1).expand_as(similarity)
         similarity = similarity.masked_fill(q_mask == 0, -1e9)
-
         c2q_attn = torch.softmax(similarity, dim=-1)
         attended_question = torch.bmm(c2q_attn, question)
 
         combined = torch.cat(
-            [
-                context,
-                attended_question,
-                context * attended_question,
-                context - attended_question,
-            ],
+            [context, attended_question, context * attended_question, context - attended_question],
             dim=-1,
         )
         return combined
 
 
 class BertBiDAF(nn.Module):
-    def __init__(
-        self,
-        bert_name: str = "bert-base-uncased",
-        hidden_dim: int = 128,
-        dropout: float = 0.1,
-        freeze_bert: bool = False,
-    ):
+    def __init__(self, bert_name: str = "bert-base-uncased", hidden_dim: int = 128, dropout: float = 0.1, freeze_bert: bool = False):
         super().__init__()
         self.bert = BertModel.from_pretrained(bert_name)
         if freeze_bert:
@@ -352,7 +353,6 @@ class BertBiDAF(nn.Module):
         self.question_proj = nn.Linear(bert_dim, hidden_dim)
         self.attention = BiDAFAttention(hidden_dim)
         self.dropout = nn.Dropout(dropout)
-
         self.modeling = nn.LSTM(
             input_size=hidden_dim * 4,
             hidden_size=hidden_dim,
@@ -360,7 +360,6 @@ class BertBiDAF(nn.Module):
             bidirectional=True,
             num_layers=1,
         )
-
         self.start_head = nn.Linear(hidden_dim * 2, 1)
         self.end_head = nn.Linear(hidden_dim * 2, 1)
 
@@ -368,38 +367,23 @@ class BertBiDAF(nn.Module):
         outputs = self.bert(input_ids=ids, attention_mask=mask)
         return outputs.last_hidden_state
 
-    def forward(
-        self,
-        context_ids: torch.Tensor,
-        question_ids: torch.Tensor,
-        context_mask: torch.Tensor,
-        question_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, context_ids: torch.Tensor, question_ids: torch.Tensor, context_mask: torch.Tensor, question_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         context_emb = self.context_proj(self.encode(context_ids, context_mask))
         question_emb = self.question_proj(self.encode(question_ids, question_mask))
-
         context_emb = self.dropout(context_emb)
         question_emb = self.dropout(question_emb)
-
         fused = self.attention(context_emb, question_emb, question_mask)
         modeled, _ = self.modeling(fused)
         modeled = self.dropout(modeled)
-
         start_logits = self.start_head(modeled).squeeze(-1)
         end_logits = self.end_head(modeled).squeeze(-1)
-
         start_logits = start_logits.masked_fill(context_mask == 0, -1e9)
         end_logits = end_logits.masked_fill(context_mask == 0, -1e9)
         return start_logits, end_logits
 
 
 class GloveBiDAF(nn.Module):
-    def __init__(
-        self,
-        embedding_matrix: np.ndarray,
-        hidden_dim: int = 128,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, embedding_matrix: np.ndarray, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
         emb_dim = embedding_matrix.shape[1]
         self.embedding = nn.Embedding.from_pretrained(
@@ -407,18 +391,8 @@ class GloveBiDAF(nn.Module):
             freeze=False,
             padding_idx=0,
         )
-        self.context_encoder = nn.LSTM(
-            input_size=emb_dim,
-            hidden_size=hidden_dim,
-            batch_first=True,
-            bidirectional=True,
-        )
-        self.question_encoder = nn.LSTM(
-            input_size=emb_dim,
-            hidden_size=hidden_dim,
-            batch_first=True,
-            bidirectional=True,
-        )
+        self.context_encoder = nn.LSTM(input_size=emb_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=True)
+        self.question_encoder = nn.LSTM(input_size=emb_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=True)
         self.attention = BiDAFAttention(hidden_dim * 2)
         self.dropout = nn.Dropout(dropout)
         self.modeling = nn.LSTM(
@@ -430,29 +404,18 @@ class GloveBiDAF(nn.Module):
         self.start_head = nn.Linear(hidden_dim * 2, 1)
         self.end_head = nn.Linear(hidden_dim * 2, 1)
 
-    def forward(
-        self,
-        context_ids: torch.Tensor,
-        question_ids: torch.Tensor,
-        context_mask: torch.Tensor,
-        question_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, context_ids: torch.Tensor, question_ids: torch.Tensor, context_mask: torch.Tensor, question_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         context_emb = self.embedding(context_ids)
         question_emb = self.embedding(question_ids)
-
         context_enc, _ = self.context_encoder(context_emb)
         question_enc, _ = self.question_encoder(question_emb)
-
         context_enc = self.dropout(context_enc)
         question_enc = self.dropout(question_enc)
-
         fused = self.attention(context_enc, question_enc, question_mask)
         modeled, _ = self.modeling(fused)
         modeled = self.dropout(modeled)
-
         start_logits = self.start_head(modeled).squeeze(-1)
         end_logits = self.end_head(modeled).squeeze(-1)
-
         start_logits = start_logits.masked_fill(context_mask == 0, -1e9)
         end_logits = end_logits.masked_fill(context_mask == 0, -1e9)
         return start_logits, end_logits
@@ -494,9 +457,9 @@ def decode_best_span(start_logits: torch.Tensor, end_logits: torch.Tensor) -> Tu
     start_probs = torch.softmax(start_logits, dim=-1)
     end_probs = torch.softmax(end_logits, dim=-1)
     seq_len = start_logits.size(0)
-
     best_score = -1.0
     best_span = (0, 0)
+
     for i in range(seq_len):
         max_j = min(seq_len, i + 30)
         for j in range(i, max_j):
@@ -532,10 +495,8 @@ def evaluate_model(model, loader, device):
                     e_idx = min(e_idx, len(tokens) - 1)
                     if e_idx < s_idx:
                         e_idx = s_idx
-
                     pred_tokens = tokens[s_idx : e_idx + 1]
-                    pred_text = " ".join(pred_tokens)
-                    pred_text = pred_text.replace(" ##", "")
+                    pred_text = " ".join(pred_tokens).replace(" ##", "")
 
                 predictions.append({"id": batch.example_ids[i], "prediction_text": pred_text})
                 references.append({"id": batch.example_ids[i], "answers": batch.answers[i]})
@@ -544,19 +505,17 @@ def evaluate_model(model, loader, device):
     return results, predictions[:5]
 
 
-# -----------------------------
-# Main
-# -----------------------------
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--embedding_type", choices=["bert", "glove"], default="bert")
     parser.add_argument("--bert_name", default="bert-base-uncased")
-    parser.add_argument("--glove_path", default="glove.6B.100d.txt")
+    parser.add_argument("--glove_path", nargs="+", default="glove.6B.100d.txt")
     parser.add_argument("--glove_dim", type=int, default=100)
-    parser.add_argument("--train_samples", type=int, default=2000)
+    parser.add_argument("--train_samples", type=int, default=10000)
     parser.add_argument("--val_samples", type=int, default=500)
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--hidden_dim", type=int, default=128)
@@ -581,42 +540,29 @@ def main():
     train_split = dataset["train"].select(range(args.train_samples))
     val_split = dataset["validation"].select(range(args.val_samples))
 
+    run_config = {
+        "embedding_type": args.embedding_type,
+        "bert_name": args.bert_name,
+        "glove_paths": args.glove_paths,
+        "glove_dim": args.glove_dim,
+        "hidden_dim": args.hidden_dim,
+        "max_context_len": args.max_context_len,
+        "max_question_len": args.max_question_len,
+        "freeze_bert": args.freeze_bert,
+    }
+
     if args.embedding_type == "bert":
-        train_ds = SquadBertDataset(
-            train_split,
-            tokenizer_name=args.bert_name,
-            max_context_len=args.max_context_len,
-            max_question_len=args.max_question_len,
-        )
-        val_ds = SquadBertDataset(
-            val_split,
-            tokenizer_name=args.bert_name,
-            max_context_len=args.max_context_len,
-            max_question_len=args.max_question_len,
-        )
+        train_ds = SquadBertDataset(train_split, tokenizer_name=args.bert_name, max_context_len=args.max_context_len, max_question_len=args.max_question_len)
+        val_ds = SquadBertDataset(val_split, tokenizer_name=args.bert_name, max_context_len=args.max_context_len, max_question_len=args.max_question_len)
         collator = QACollator(pad_id=0)
-        model = BertBiDAF(
-            bert_name=args.bert_name,
-            hidden_dim=args.hidden_dim,
-            freeze_bert=args.freeze_bert,
-        )
+        model = BertBiDAF(bert_name=args.bert_name, hidden_dim=args.hidden_dim, freeze_bert=args.freeze_bert)
     else:
         train_list = [train_split[i] for i in range(len(train_split))]
         word2idx = build_vocab(train_list)
-        embedding_matrix = load_glove(args.glove_path, word2idx, args.glove_dim)
+        embedding_matrix = load_glove_from_multiple(args.glove_paths, word2idx, args.glove_dim)
 
-        train_ds = SquadStaticDataset(
-            train_split,
-            word2idx=word2idx,
-            max_context_len=args.max_context_len,
-            max_question_len=args.max_question_len,
-        )
-        val_ds = SquadStaticDataset(
-            val_split,
-            word2idx=word2idx,
-            max_context_len=args.max_context_len,
-            max_question_len=args.max_question_len,
-        )
+        train_ds = SquadStaticDataset(train_split, word2idx=word2idx, max_context_len=args.max_context_len, max_question_len=args.max_question_len)
+        val_ds = SquadStaticDataset(val_split, word2idx=word2idx, max_context_len=args.max_context_len, max_question_len=args.max_question_len)
         collator = QACollator(pad_id=0)
         model = GloveBiDAF(embedding_matrix=embedding_matrix, hidden_dim=args.hidden_dim)
 
@@ -630,7 +576,6 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_metrics, sample_preds = evaluate_model(model, val_loader, device)
-
         log_row = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -645,20 +590,29 @@ def main():
 
     metrics_path = os.path.join(args.save_dir, f"{args.run_name}_{args.embedding_type}_metrics.json")
     model_path = os.path.join(args.save_dir, f"{args.run_name}_{args.embedding_type}.pt")
+    config_path = os.path.join(args.save_dir, f"{args.run_name}_{args.embedding_type}_config.json")
+
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(run_config, f, indent=2)
 
     torch.save(model.state_dict(), model_path)
     print(f"Saved metrics to: {metrics_path}")
     print(f"Saved model to: {model_path}")
+    print(f"Saved config to: {config_path}")
 
-    print("\nHow to analyze BERT vs GloVe:")
-    print("1. Run once with --embedding_type glove")
-    print("2. Run once with --embedding_type bert")
-    print("3. Compare final EM and F1 in the saved metrics JSON files")
-    print("4. Also compare training speed and GPU memory usage")
-    print("5. Inspect sample predictions to see whether BERT improves boundary accuracy and paraphrase handling")
+    if args.embedding_type == "glove":
+        word2idx_path = os.path.join(args.save_dir, f"{args.run_name}_{args.embedding_type}_word2idx.pt")
+        embedding_matrix_path = os.path.join(args.save_dir, f"{args.run_name}_{args.embedding_type}_embedding_matrix.pt")
+        torch.save(word2idx, word2idx_path)
+        torch.save(torch.tensor(embedding_matrix, dtype=torch.float32), embedding_matrix_path)
+        print(f"Saved word2idx to: {word2idx_path}")
+        print(f"Saved embedding matrix to: {embedding_matrix_path}")
+
 
 
 if __name__ == "__main__":
     main()
+
