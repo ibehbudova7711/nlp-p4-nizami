@@ -12,7 +12,7 @@ from nlpp4 import BertBiDAF, GloveBiDAF
 
 st.set_page_config(page_title="BiDAF QA Demo", layout="wide")
 
-BERT_NAME = "bert-base-uncased"
+BERT_NAME = "/Users/aliyevamehriban/bert_local"
 MAX_CONTEXT_LEN = 384
 MAX_QUESTION_LEN = 64
 HIDDEN_DIM = 128
@@ -195,12 +195,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 st.sidebar.header("Model files")
 st.sidebar.write(f"Running on: **{device}**")
 
-bert_model_path = st.sidebar.text_input("BERT model .pt path", value="outputs/bert_bidaf_bert.pt")
-glove_model_path = st.sidebar.text_input("GloVe model .pt path", value="outputs/glove_baseline_glove.pt")
-glove_emb_path = st.sidebar.text_input("GloVe embedding matrix path", value="glove_embedding_matrix.pt")
-glove_vocab_path = st.sidebar.text_input("GloVe word2idx path", value="glove_word2idx.pt")
+bert_model_path = st.sidebar.text_input("BERT model .pt path", value="/Users/aliyevamehriban/Downloads/bert-output/run_bert.pt")
+glove_model_path = st.sidebar.text_input("GloVe model .pt path", value="run_glove-2.pt")
+glove_emb_path = st.sidebar.text_input("GloVe embedding matrix path", value="run_glove_embedding_matrix.pt")
+glove_vocab_path = st.sidebar.text_input("GloVe word2idx path", value="run_glove_word2idx.pt")
 
-example_context = "Baku is the capital and largest city of Azerbaijan. It is located on the Caspian Sea coast."
+example_context = "Baku is the capital and largest city of Azerbaijan."
 example_question = "What is the capital of Azerbaijan?"
 
 col1, col2 = st.columns(2)
@@ -267,7 +267,5 @@ st.markdown(
     "**This version expects `.pt` files**  \n"
     "- BERT model file: a `state_dict` saved with `torch.save(model.state_dict(), path)`  \n"
     "- GloVe model file: a `state_dict` saved with `torch.save(model.state_dict(), path)`  \n"
-    "- GloVe embedding matrix file: saved separately, for example `torch.save(embedding_matrix, 'glove_embedding_matrix.pt')`  \n"
-    "- GloVe vocab file: saved separately, for example `torch.save(word2idx, 'glove_word2idx.pt')`"
 )
 st.code("streamlit run ui_pt.py", language="bash")

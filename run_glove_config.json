@@ -1,0 +1,12 @@
+{
+  "embedding_type": "glove",
+  "bert_name": "bert-base-uncased",
+  "glove_path": [
+    "/content/glove.6B.100d.txt"
+  ],
+  "glove_dim": 100,
+  "hidden_dim": 128,
+  "max_context_len": 384,
+  "max_question_len": 64,
+  "freeze_bert": false
+}

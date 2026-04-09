@@ -421,9 +421,6 @@ class GloveBiDAF(nn.Module):
         return start_logits, end_logits
 
 
-# -----------------------------
-# Train / Eval
-# -----------------------------
 
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
